@@ -32,6 +32,34 @@ class MatchResult:
         return f"MatchResult(mark='{self.mark}', model='{self.model}', score={self.combined_score:.1f})"
 
 
+@dataclass
+class BrandMatch:
+    """Result of a brand match with its models."""
+    brand: str
+    brand_score: float
+    models: list[tuple[str, float]]  # List of (model_name, model_score)
+    
+    def __repr__(self):
+        return f"BrandMatch(brand='{self.brand}', score={self.brand_score:.1f}, models={len(self.models)})"
+
+
+@dataclass 
+class HierarchicalResult:
+    """Result from hierarchical matching."""
+    brand: str
+    model: str
+    brand_score: float
+    model_score: float
+    combined_score: float
+    rank_brand: int      # Rank of brand in brand search (1-based)
+    rank_model: int      # Rank of model within brand (1-based)
+    original_index: int
+    
+    def __repr__(self):
+        return (f"HierarchicalResult('{self.brand}' #{self.rank_brand} -> "
+                f"'{self.model}' #{self.rank_model}, score={self.combined_score:.1f})")
+
+
 class VehicleMatcher:
     """
     Fuzzy matcher for vehicle marks and models.
@@ -332,6 +360,193 @@ class VehicleMatcher:
                 unique_results.append(r)
         
         return unique_results[:top_k]
+
+
+class HierarchicalMatcher(VehicleMatcher):
+    """
+    Hierarchical vehicle matcher with explicit two-step search:
+    
+    Step 1: Find top-N most similar brands
+    Step 2: For each brand, find most similar models
+    
+    This approach is more structured and gives better control over matching.
+    """
+    
+    def match_hierarchical(
+        self,
+        query_brand: str,
+        query_model: str,
+        top_n_brands: int = 3,
+        top_n_models: int = 5,
+        min_brand_score: float = 50.0,
+        min_model_score: float = 40.0
+    ) -> list[HierarchicalResult]:
+        """
+        Hierarchical matching: first brands, then models within each brand.
+        
+        Args:
+            query_brand: User's brand query (can have typos, Russian or English).
+            query_model: User's model query (can have typos).
+            top_n_brands: Number of top brands to consider.
+            top_n_models: Number of top models to return per brand.
+            min_brand_score: Minimum score for brand matching (0-100).
+            min_model_score: Minimum score for model matching (0-100).
+            
+        Returns:
+            List of HierarchicalResult sorted by combined score.
+        """
+        results = []
+        
+        # Step 1: Find top-N similar brands
+        similar_brands = self.find_similar_marks(
+            query_brand, 
+            top_k=top_n_brands, 
+            min_score=min_brand_score
+        )
+        
+        if not similar_brands:
+            return []
+        
+        # Step 2: For each brand, find similar models
+        for brand_rank, (brand, brand_score) in enumerate(similar_brands, 1):
+            similar_models = self.find_similar_models(
+                query_model,
+                mark=brand,
+                top_k=top_n_models,
+                min_score=min_model_score
+            )
+            
+            for model_rank, (model, model_score) in enumerate(similar_models, 1):
+                # Combined score: weighted average
+                combined = 0.4 * brand_score + 0.6 * model_score
+                
+                # Get original row index and names
+                mask = (self.df['mark_clean'] == brand) & (self.df['model_clean'] == model)
+                indices = self.df[mask].index.tolist()
+                original_idx = indices[0] if indices else -1
+                
+                if original_idx >= 0:
+                    original_brand = self.df.loc[original_idx, self.mark_column]
+                    original_model = self.df.loc[original_idx, self.model_column]
+                else:
+                    original_brand = brand
+                    original_model = model
+                
+                results.append(HierarchicalResult(
+                    brand=original_brand,
+                    model=original_model,
+                    brand_score=brand_score,
+                    model_score=model_score,
+                    combined_score=combined,
+                    rank_brand=brand_rank,
+                    rank_model=model_rank,
+                    original_index=original_idx
+                ))
+        
+        # Sort by combined score
+        results.sort(key=lambda x: -x.combined_score)
+        return results
+    
+    def match_brands_with_models(
+        self,
+        query_brand: str,
+        query_model: str,
+        top_n_brands: int = 3,
+        top_n_models: int = 5,
+        min_brand_score: float = 50.0,
+        min_model_score: float = 40.0
+    ) -> list[BrandMatch]:
+        """
+        Get brands with their matching models (grouped by brand).
+        
+        Returns results grouped by brand, showing which models matched
+        within each brand. Useful for displaying hierarchical results.
+        
+        Args:
+            query_brand: User's brand query.
+            query_model: User's model query.
+            top_n_brands: Number of top brands to return.
+            top_n_models: Number of top models per brand.
+            min_brand_score: Minimum brand score.
+            min_model_score: Minimum model score.
+            
+        Returns:
+            List of BrandMatch objects, each containing brand and its models.
+        """
+        results = []
+        
+        # Step 1: Find similar brands
+        similar_brands = self.find_similar_marks(
+            query_brand,
+            top_k=top_n_brands,
+            min_score=min_brand_score
+        )
+        
+        # Step 2: For each brand, find models
+        for brand_clean, brand_score in similar_brands:
+            similar_models = self.find_similar_models(
+                query_model,
+                mark=brand_clean,
+                top_k=top_n_models,
+                min_score=min_model_score
+            )
+            
+            # Get original brand name
+            if brand_clean in self.mark_to_indices:
+                idx = self.mark_to_indices[brand_clean][0]
+                original_brand = self.df.loc[idx, self.mark_column]
+            else:
+                original_brand = brand_clean
+            
+            # Get original model names
+            models_with_original_names = []
+            for model_clean, model_score in similar_models:
+                mask = (self.df['mark_clean'] == brand_clean) & (self.df['model_clean'] == model_clean)
+                indices = self.df[mask].index.tolist()
+                if indices:
+                    original_model = self.df.loc[indices[0], self.model_column]
+                else:
+                    original_model = model_clean
+                models_with_original_names.append((original_model, model_score))
+            
+            results.append(BrandMatch(
+                brand=original_brand,
+                brand_score=brand_score,
+                models=models_with_original_names
+            ))
+        
+        return results
+    
+    def search(
+        self,
+        query_brand: str,
+        query_model: str,
+        top_n_brands: int = 3,
+        top_n_models: int = 3,
+        top_k: int = 5
+    ) -> list[HierarchicalResult]:
+        """
+        Simple search interface - returns top-K results.
+        
+        This is a convenience wrapper around match_hierarchical.
+        
+        Args:
+            query_brand: Brand query with possible typos.
+            query_model: Model query with possible typos.
+            top_n_brands: How many brands to consider.
+            top_n_models: How many models per brand.
+            top_k: Total number of results to return.
+            
+        Returns:
+            Top-K HierarchicalResult sorted by combined score.
+        """
+        results = self.match_hierarchical(
+            query_brand,
+            query_model,
+            top_n_brands=top_n_brands,
+            top_n_models=top_n_models
+        )
+        return results[:top_k]
 
 
 def find_similar_vehicles(
